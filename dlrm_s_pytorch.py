@@ -61,6 +61,7 @@ import datetime
 import json
 import sys
 import time
+from typing import Dict, List
 
 # onnx
 # The onnx import causes deprecation warnings every time workers
@@ -193,6 +194,9 @@ class LRPolicyScheduler(_LRScheduler):
 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
+
+    emb_l_q: List[torch.Tensor]
+
     def create_mlp(self, ln, sigmoid_layer):
         # build MLP layer by layer
         layers = nn.ModuleList()
@@ -240,7 +244,7 @@ class DLRM_Net(nn.Module):
             if ext_dist.my_size > 1:
                 if i not in self.local_emb_indices:
                     continue
-            n = ln[i]
+            n = int(ln[i])
 
             # construct embedding operator
             if self.qr_flag and n > self.qr_threshold:
@@ -305,6 +309,7 @@ class DLRM_Net(nn.Module):
     ):
         super(DLRM_Net, self).__init__()
 
+        self.emb_l_q: List[torch.Tensor] = []
         if (
             (m_spa is not None)
             and (ln_emb is not None)
@@ -367,7 +372,7 @@ class DLRM_Net(nn.Module):
 
             # quantization
             self.quantize_emb = False
-            self.emb_l_q = []
+            self.emb_l_q: List[torch.Tensor] = []
             self.quantize_bits = 32
 
             # specify the loss function
@@ -393,7 +398,7 @@ class DLRM_Net(nn.Module):
         # approach 2: use Sequential container to wrap all layers
         return layers(x)
 
-    def apply_emb(self, lS_o, lS_i, emb_l, v_W_l):
+    def apply_emb(self, lS_o, lS_i):
         # WARNING: notice that we are processing the batch at once. We implicitly
         # assume that the data is laid out such that:
         # 1. each embedding is indexed with a group of sparse indices,
@@ -402,7 +407,8 @@ class DLRM_Net(nn.Module):
         # 3. for a list of embedding tables there is a list of batched lookups
 
         ly = []
-        for k, sparse_index_group_batch in enumerate(lS_i):
+        for k, E in enumerate(self.emb_l):
+            sparse_index_group_batch = lS_i[k]
             sparse_offset_group_batch = lS_o[k]
 
             # embedding lookup
@@ -411,14 +417,14 @@ class DLRM_Net(nn.Module):
             # happening vertically across 0 axis, resulting in a row vector
             # E = emb_l[k]
 
-            if v_W_l[k] is not None:
-                per_sample_weights = v_W_l[k].gather(0, sparse_index_group_batch)
+            if self.v_W_l[k] is not None:
+                per_sample_weights = self.v_W_l[k].gather(0, sparse_index_group_batch)
             else:
                 per_sample_weights = None
 
             if self.quantize_emb:
-                s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
+                s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].numel()
+                s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].numel()
                 print("quantized emb sizes:", s1, s2)
 
                 if self.quantize_bits == 4:
@@ -428,6 +434,7 @@ class DLRM_Net(nn.Module):
                         sparse_offset_group_batch,
                         per_sample_weights=per_sample_weights,
                     )
+                    ly.append(QV)
                 elif self.quantize_bits == 8:
                     QV = ops.quantized.embedding_bag_byte_rowwise_offsets(
                         self.emb_l_q[k],
@@ -435,10 +442,9 @@ class DLRM_Net(nn.Module):
                         sparse_offset_group_batch,
                         per_sample_weights=per_sample_weights,
                     )
+                    ly.append(QV)
 
-                ly.append(QV)
             else:
-                E = emb_l[k]
                 V = E(
                     sparse_index_group_batch,
                     sparse_offset_group_batch,
@@ -454,7 +460,7 @@ class DLRM_Net(nn.Module):
     def quantize_embedding(self, bits):
 
         n = len(self.emb_l)
-        self.emb_l_q = [None] * n
+        self.emb_l_q: List[torch.Tensor] = [None] * n
         for k in range(n):
             if bits == 4:
                 self.emb_l_q[k] = ops.quantized.embedding_bag_4bit_prepack(
@@ -470,7 +476,7 @@ class DLRM_Net(nn.Module):
         self.quantize_emb = True
         self.quantize_bits = bits
 
-    def interact_features(self, x, ly):
+    def interact_features(self, x: torch.Tensor, ly: List[torch.Tensor]):
 
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
@@ -488,8 +494,20 @@ class DLRM_Net(nn.Module):
             # li, lj = torch.tril_indices(ni, nj, offset=offset)
             # approach 2: custom
             offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            #li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+            #lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            lli: List[int] = []
+            llj: List[int] = []
+            for idx in range(ni):
+                for j in range(idx + offset):
+                    lli.append(idx)
+            li = torch.tensor(lli)
+
+            for idx in range(nj):
+                for j in range(idx + offset):
+                    llj.append(j)
+            lj = torch.tensor(llj)
+
             Zflat = Z[:, li, lj]
             # concatenate dense features and interactions
             R = torch.cat([x] + [Zflat], dim=1)
@@ -497,7 +515,7 @@ class DLRM_Net(nn.Module):
             # concatenation features (into a row vector)
             R = torch.cat([x] + ly, dim=1)
         else:
-            sys.exit(
+            raise Exception(
                 "ERROR: --arch-interaction-op="
                 + self.arch_interaction_op
                 + " is not supported"
@@ -506,15 +524,26 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
+        # for our use case (CPU inference) distributed and parallel cases 
+        # are not relevant. Parallel forward is multi GPU only use case, so
+        # we can disable it.
         if ext_dist.my_size > 1:
-            # multi-node multi-device run
-            return self.distributed_forward(dense_x, lS_o, lS_i)
+            raise Exception("Not supported")
+        #    # multi-node multi-device run
+        #    return self.distributed_forward(dense_x, lS_o, lS_i)
         elif self.ndevices <= 1:
             # single device run
             return self.sequential_forward(dense_x, lS_o, lS_i)
         else:
             # single-node multi-device run
-            return self.parallel_forward(dense_x, lS_o, lS_i)
+            #return self.parallel_forward(dense_x, lS_o, lS_i)
+            raise Exception("Not supported")
+
+    def apply_mlp_bot(self, x):
+        return self.bot_l(x)
+
+    def apply_mlp_top(self, x):
+        return self.top_l(x)
 
     def distributed_forward(self, dense_x, lS_o, lS_i):
         batch_size = dense_x.size()[0]
@@ -541,7 +570,7 @@ class DLRM_Net(nn.Module):
 
         # embeddings
         with record_function("DLRM embedding forward"):
-            ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
+            ly = self.apply_emb(lS_o, lS_i)
 
         # WARNING: Note that at this point we have the result of the embedding lookup
         # for the entire batch on each rank. We would like to obtain partial results
@@ -554,7 +583,7 @@ class DLRM_Net(nn.Module):
         a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank)
 
         with record_function("DLRM bottom nlp forward"):
-            x = self.apply_mlp(dense_x, self.bot_l)
+            x = self.apply_mlp_bot(dense_x)
 
         ly = a2a_req.wait()
         ly = list(ly)
@@ -565,7 +594,7 @@ class DLRM_Net(nn.Module):
 
         # top mlp
         with record_function("DLRM top nlp forward"):
-            p = self.apply_mlp(z, self.top_l)
+            p = self.apply_mlp_top(z)
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
@@ -577,13 +606,13 @@ class DLRM_Net(nn.Module):
 
     def sequential_forward(self, dense_x, lS_o, lS_i):
         # process dense features (using bottom mlp), resulting in a row vector
-        x = self.apply_mlp(dense_x, self.bot_l)
+        x = self.apply_mlp_bot(dense_x)
         # debug prints
         # print("intermediate")
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
+        ly = self.apply_emb(lS_o, lS_i)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
@@ -592,7 +621,7 @@ class DLRM_Net(nn.Module):
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
-        p = self.apply_mlp(z, self.top_l)
+        p = self.apply_mlp_top(z)
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
@@ -668,7 +697,7 @@ class DLRM_Net(nn.Module):
         # print(x)
 
         # embeddings
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
+        ly = self.apply_emb(lS_o, lS_i)
         # debug prints
         # print(ly)
 
